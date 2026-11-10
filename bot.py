@@ -126,3 +126,19 @@ def main():
 
 if __name__ == "__main__":
     main()
+if __name__ == "__main__":
+    import os
+    from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler
+    
+    # Flask keep-alive thread already running above
+    # Telegram Bot Application setup
+    token = "9082371911:AAHrAK-pBBZhreHXXdT-Wu3zxvLx7mNkTrE"
+    application = ApplicationBuilder().token(token).build()
+    
+    # Handlers add kora
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button))
+    
+    # Bot run kora (Polling)
+    print("Bot is polling...")
+    application.run_polling()
