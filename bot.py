@@ -26,8 +26,11 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 LOCAL_TZ = pytz.timezone("Asia/Phnom_Penh")
 
 # Dictionary to track ongoing breaks for each user
-# Format: {user_id: {"activity": "Eat", "limit": 40, "start_time": datetime_obj}}
 user_active_breaks = {}
+
+# Dictionary to store daily violation records/reports
+# Format: {user_id: {"name": "Luffy", "violations": 3, "details": [...]}}
+daily_reports = {}
 
 
 def get_main_keyboard():
@@ -50,11 +53,17 @@ def get_back_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
+def record_violation(user_id, name, violation_text):
+    if user_id not in daily_reports:
+        daily_reports[user_id] = {"name": name, "count": 0, "logs": []}
+    daily_reports[user_id]["count"] += 1
+    daily_reports[user_id]["logs"].append(violation_text)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
 
-    # If user is currently on a break, restrict them to Back to Seat only
     if user_id in user_active_breaks:
         active_activity = user_active_breaks[user_id]["activity"]
         reply_markup = get_back_keyboard()
@@ -67,6 +76,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=reply_markup)
     elif update.callback_query:
         await update.callback_query.message.reply_text(text, reply_markup=reply_markup)
+
+
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command to view daily late/violation records of staff"""
+    if not daily_reports:
+        await update.message.reply_text("📊 No violations or late records today. Everyone is performing well!")
+        return
+
+    report_text = "📊 **Daily Violation & Late Report:**\n\n"
+    for uid, data in daily_reports.items():
+        report_text += f"👤 **{data['name']}** - Total Violations: {data['count']}\n"
+        for log in data["logs"]:
+            report_text += f"   - {log}\n"
+        report_text += "\n"
+
+    await update.message.reply_text(report_text, parse_mode="Markdown")
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -82,9 +107,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_hour = now.hour
     action = query.data
 
-    # Check if user is currently on a break
     if user_id in user_active_breaks:
-        # If they are on a break, they are ONLY allowed to click 'back_to_seat'
         if action != "back_to_seat":
             active_activity = user_active_breaks[user_id]["activity"]
             await query.message.reply_text(
@@ -93,37 +116,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Handling Back to Seat
         break_info = user_active_breaks[user_id]
         activity_name = break_info["activity"]
         limit_minutes = break_info["limit"]
         start_time = break_info["start_time"]
 
         elapsed_minutes = int((now - start_time).total_seconds() / 60)
-        
-        # Remove user from active break state
         del user_active_breaks[user_id]
 
         if elapsed_minutes > limit_minutes:
             extra_time = elapsed_minutes - limit_minutes
-            message = f"⚠️ {name} took extra time on {activity_name}! Spent {elapsed_minutes} mins (Allowed: {limit_minutes}m). Overtime: {extra_time} mins. [{current_time_str}]"
+            v_msg = f"Exceeded {activity_name} by {extra_time}m (Spent {elapsed_minutes}m)"
+            record_violation(user_id, name, v_msg)
+
+            message = f"⚠️ {name} took extra time on {activity_name}! Spent {elapsed_minutes} mins (Allowed: {limit_minutes}m). Overtime: {extra_time} mins. ❌ Added to penalty list! [{current_time_str}]"
         else:
             message = f"✅ {name} returned to seat on time from {activity_name}! Spent {elapsed_minutes} mins. [{current_time_str}]"
 
         await query.message.reply_text(message, reply_markup=get_main_keyboard())
         return
 
-    # Normal actions when NOT on a break
     if action == "startwork":
         if current_hour >= 15:
-            message = f"⚠️ {name}, you are late! Startwork logged at: [{current_time_str}]"
+            v_msg = f"Late Startwork at {current_time_str}"
+            record_violation(user_id, name, v_msg)
+            message = f"⚠️ {name}, you are late! Startwork logged at: [{current_time_str}] (Penalized)"
         else:
             message = f"✅ {name}, Startwork successful on time! [{current_time_str}]"
         await query.message.reply_text(message, reply_markup=get_main_keyboard())
 
     elif action == "offwork":
         if current_hour < 3:
-            message = f"⚠️ {name}, you gave Offwork before 3:00 AM! [{current_time_str}]"
+            v_msg = f"Early Offwork at {current_time_str}"
+            record_violation(user_id, name, v_msg)
+            message = f"⚠️ {name}, you gave Offwork before 3:00 AM! [{current_time_str}] (Penalized)"
         else:
             message = f"🔴 {name}, Offwork logged successfully! [{current_time_str}]"
         await query.message.reply_text(message, reply_markup=get_main_keyboard())
@@ -132,7 +158,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         limits = {"eat": (40, "Eat (40m)"), "smoke": (10, "Smoke (10m)"), "toilet": (15, "Toilet (15m)")}
         limit_minutes, limit_name = limits[action]
 
-        # Save break state
         user_active_breaks[user_id] = {
             "activity": limit_name,
             "limit": limit_minutes,
@@ -155,6 +180,7 @@ def main():
     application = ApplicationBuilder().token(TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CallbackQueryHandler(button_handler))
 
     application.run_polling()
