@@ -1,93 +1,106 @@
-import os
-import logging
 from datetime import datetime
-import pytz
+import os
 from flask import Flask
-from threading import Thread
+import pytz
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
 
-# Logging setup
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+# Flask server to keep Render happy (keep-alive)
+app = Flask(__name__)
 
-# Flask app for keep-alive
-app = Flask('')
 
-@app.route('/')
+@app.route("/")
 def home():
-    return "Bot is running!"
+    return "Office-bot is alive!"
 
-def run():
-    app.run(host='0.0.0.0', port=8080)
 
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
+# Telegram Bot Token from environment variable
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-user_status = {}
-BD_TIMEZONE = pytz.timezone("Asia/Dhaka")
+# Timezone setup (Cambodia local time)
+LOCAL_TZ = pytz.timezone("Asia/Phnom_Penh")
 
-def get_bd_time():
-    return datetime.now(BD_TIMEZONE)
+# Dictionary to track start times of breaks for each user
+# Format: {user_id: {"activity": "eat", "start_time": datetime_obj}}
+user_breaks = {}
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("🟢 Startwork", callback_data="startwork"), InlineKeyboardButton("🔴 Offwork", callback_data="offwork")],
-        [InlineKeyboardButton("🍽️ Eat (40m)", callback_data="eat"), InlineKeyboardButton("🚬 Smoke (10m)", callback_data="smoke")],
-        [InlineKeyboardButton("🚻 Toilet (15m)", callback_data="toilet")]
+        [
+            InlineKeyboardButton("🟢 Startwork", callback_data="startwork"),
+            InlineKeyboardButton("🔴 Offwork", callback_data="offwork"),
+        ],
+        [
+            InlineKeyboardButton("🍽️ Eat (40m)", callback_data="eat"),
+            InlineKeyboardButton("🚬 Smoke (10m)", callback_data="smoke"),
+        ],
+        [InlineKeyboardButton("🚻 Toilet (15m)", callback_data="toilet")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("অফিস অ্যাক্টিভিটি সিলেক্ট করুন:", reply_markup=reply_markup)
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        await update.message.reply_text(
+            "Select Office Activity:", reply_markup=reply_markup
+        )
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(
+            "Select Office Activity:", reply_markup=reply_markup
+        )
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    user_id = query.from_user.id
-    user_name = query.from_user.first_name
-    current_time = get_bd_time()
-    action_type = query.data
-    current_hour = current_time.hour
-    current_minute = current_time.minute
+    user = query.from_user
+    user_id = user.id
+    name = user.first_name
 
-    # 1. STARTWORK: Anytime click, warn if after 3:00 PM (15:00)
-    if action_type == "startwork":
-        user_status[user_id] = {"active_action": "startwork", "start_time": current_time}
-        if current_hour >= 15 and (current_hour > 15 or current_minute > 0):
-            await query.message.reply_text(text=f"⚠️ {user_name}, আপনি দেরিতে (দুপুর ৩:টার পরে) Startwork করেছেন! [Time: {current_time.strftime('%I:%M %p')}]")
+    now = datetime.now(LOCAL_TZ)
+    current_time_str = now.strftime("%I:%M %p")
+    current_hour = now.hour
+    action = query.data
+
+    if action == "startwork":
+        # Startwork after 3:00 PM (15:00) is considered late
+        if current_hour >= 15:
+            message = f"⚠️ {name}, you are late! Startwork logged at: [{current_time_str}]"
         else:
-            await query.message.reply_text(text=f"✅ {user_name}, সময়মতো Startwork সফল হয়েছে! [Time: {current_time.strftime('%I:%M %p')}]")
-        return
+            message = (
+                f"✅ {name}, Startwork successful on time! [{current_time_str}]"
+            )
+        await query.message.reply_text(message)
 
-    # 2. OFFWORK: Anytime click, warn if before 3:00 AM
-    if action_type == "offwork":
+    elif action == "offwork":
+        # Warning if offwork is given before 3:00 AM (03:00)
         if current_hour < 3:
-            await query.message.reply_text(text=f"⚠️ {user_name}, আপনি রাত ৩:টার আগেই Offwork দিয়েছেন! [Time: {current_time.strftime('%I:%M %p')}]")
+            message = f"⚠️ {name}, you gave Offwork before 3:00 AM! [{current_time_str}]"
         else:
-            await query.message.reply_text(text=f"🔴 {user_name}, সফলভাবে Offwork রেকর্ড করা হয়েছে। [Time: {current_time.strftime('%I:%M %p')}]")
-        
-        if user_id in user_status:
-            user_status[user_id]["active_action"] = "offwork"
-        return
+            message = f"🔴 {name}, Offwork logged successfully! [{current_time_str}]"
+        await query.message.reply_text(message)
 
-    # 3. BREAKS
-    if action_type in ["eat", "smoke", "toilet"]:
-        if user_id not in user_status or user_status[user_id].get("active_action") != "startwork":
-            await query.message.reply_text(text=f"❌ {user_name}, আগে 'Startwork' করুন তারপর ব্রেক নিতে পারবেন!")
-            return
+    elif action in ["eat", "smoke", "toilet"]:
+        # If user is already on a break, calculate duration when they click another button or finish/switch
+        limit_minutes = {"eat": 40, "smoke": 10, "toilet": 15}[action]
+        limit_name = {"eat": "Eat (40m)", "smoke": "Smoke (10m)", "toilet": "Toilet (15m)"}[action]
 
-        user_status[user_id][f"{action_type}_start"] = current_time
-        await query.message.reply_text(text=f"⏳ {user_name}, আপনার {action_type.capitalize()} শুরু হলো। সময়: {current_time.strftime('%I:%M %p')}")
-        return
+        if user_id in user_breaks:
+            prev_data = user_breaks[user_id]
+            prev_start = prev_data["start_time"]
+            prev_activity = prev_data["activity"]
 
-if __name__ == "__main__":
-    keep_alive()
-    
-    token = "9082371911:AAHrAK-pBBZhreHXXdT-Wu3zxvLx7mNkTrE"
-    application = ApplicationBuilder().token(token).build()
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(button))
-    
-    print("Bot is polling...")
-    application.run_polling()
+            elapsed_minutes = int((now - prev_start).total_seconds() / 60)
+
+            if elapsed_minutes > limit_minutes:
+                extra_time = elapsed_minutes - limit_minutes
+                await query.message.reply_text(
+                    f"⚠️ {name} exceeded the time limit for {prev_activity}! Spent {elapsed_minutes} mins (Allowed: {limit_minutes}m). Overtime: {extra_time} mins."
+                )
+
+        # Record
